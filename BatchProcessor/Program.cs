@@ -3,19 +3,18 @@
 
 
 
+using System.Collections.Concurrent;
+
 Console.WriteLine("Large batch processor started");
 
 using var cancellationTokenSource = new CancellationTokenSource();
 
-// Change this if you want to test cancellation.
-// For 1 million fake jobs, you may want a longer timeout.
-cancellationTokenSource.CancelAfter(TimeSpan.FromSeconds(30));
+// Increase, reduce, or comment this out to test cancellation.
+// cancellationTokenSource.CancelAfter(TimeSpan.FromSeconds(30));
 
 CancellationToken cancellationToken = cancellationTokenSource.Token;
 
-// For learning, start with 100 or 1,000.
-// Then try 1_000_000.
-List<FakeJob> jobs = Enumerable.Range(1, 100_000)
+List<FakeJob> jobs = Enumerable.Range(1, 1000)
     .Select(id => new FakeJob(
         Id: id,
         Name: $"Job {id}",
@@ -26,16 +25,42 @@ var processor = new LargeBatchProcessor(
     workerCount: 10,
     maxRetryAttempts: 3);
 
-BatchSummary summary = await processor.ProcessAsync(
+BatchResult batchResult = await processor.ProcessAsync(
     jobs,
     cancellationToken);
 
 Console.WriteLine();
 Console.WriteLine("Batch finished");
-Console.WriteLine($"Total: {summary.Total}");
-Console.WriteLine($"Succeeded: {summary.Succeeded}");
-Console.WriteLine($"Failed: {summary.Failed}");
-Console.WriteLine($"Cancelled: {summary.Cancelled}");
+Console.WriteLine($"Total: {batchResult.Summary.Total}");
+Console.WriteLine($"Succeeded: {batchResult.Summary.Succeeded}");
+Console.WriteLine($"Failed: {batchResult.Summary.Failed}");
+Console.WriteLine($"Cancelled: {batchResult.Summary.Cancelled}");
+
+Console.WriteLine();
+Console.WriteLine("First 10 stored results:");
+
+foreach (JobResult result in batchResult.Results.Values
+             .OrderBy(r => r.JobId)
+             .Take(10))
+{
+    Console.WriteLine(
+        $"Job {result.JobId}: {GetStatusText(result)} - {result.Message}");
+}
+
+static string GetStatusText(JobResult result)
+{
+    if (result.Success)
+    {
+        return "Success";
+    }
+
+    if (result.Cancelled)
+    {
+        return "Cancelled";
+    }
+
+    return "Failed";
+}
 
 public sealed class LargeBatchProcessor
 {
@@ -64,11 +89,13 @@ public sealed class LargeBatchProcessor
         _maxRetryAttempts = maxRetryAttempts;
     }
 
-    public async Task<BatchSummary> ProcessAsync(
+    public async Task<BatchResult> ProcessAsync(
         IReadOnlyList<FakeJob> jobs,
         CancellationToken cancellationToken)
     {
-        var jobSource = new JobSource(jobs);
+        var queue = new ConcurrentQueue<FakeJob>(jobs);
+
+        var results = new ConcurrentDictionary<int, JobResult>();
 
         int total = 0;
         int succeeded = 0;
@@ -78,9 +105,11 @@ public sealed class LargeBatchProcessor
         Task[] workers = Enumerable.Range(1, _workerCount)
             .Select(workerId => WorkerAsync(
                 workerId,
-                jobSource,
+                queue,
+                results,
+                jobs.Count,
                 cancellationToken,
-                onJobCompleted: result =>
+                result =>
                 {
                     Interlocked.Increment(ref total);
 
@@ -109,34 +138,34 @@ public sealed class LargeBatchProcessor
 
         await Task.WhenAll(workers);
 
-        return new BatchSummary(
+        var summary = new BatchSummary(
             Total: total,
             Succeeded: succeeded,
             Failed: failed,
             Cancelled: cancelled);
+
+        return new BatchResult(
+            Summary: summary,
+            Results: results);
     }
 
     private async Task WorkerAsync(
         int workerId,
-        JobSource jobSource,
+        ConcurrentQueue<FakeJob> queue,
+        ConcurrentDictionary<int, JobResult> results,
+        int totalJobCount,
         CancellationToken cancellationToken,
         Action<JobResult> onJobCompleted)
     {
-        while (true)
+        while (!cancellationToken.IsCancellationRequested &&
+               queue.TryDequeue(out FakeJob? job))
         {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            FakeJob? job = jobSource.GetNextJob();
-
-            if (job is null)
-            {
-                break;
-            }
-
             JobResult result = await ProcessJobWithRetryAsync(
                 workerId,
                 job,
                 cancellationToken);
+
+            results[result.JobId] = result;
 
             onJobCompleted(result);
         }
@@ -151,10 +180,14 @@ public sealed class LargeBatchProcessor
         {
             try
             {
-                await DoFakeWorkAsync(workerId, job, cancellationToken);
+                await DoFakeWorkAsync(
+                    workerId,
+                    job,
+                    cancellationToken);
 
                 return new JobResult(
                     JobId: job.Id,
+                    JobName: job.Name,
                     Success: true,
                     Cancelled: false,
                     Attempts: attempt,
@@ -164,6 +197,7 @@ public sealed class LargeBatchProcessor
             {
                 return new JobResult(
                     JobId: job.Id,
+                    JobName: job.Name,
                     Success: false,
                     Cancelled: true,
                     Attempts: attempt,
@@ -175,20 +209,38 @@ public sealed class LargeBatchProcessor
                 {
                     return new JobResult(
                         JobId: job.Id,
+                        JobName: job.Name,
                         Success: false,
                         Cancelled: false,
                         Attempts: attempt,
                         Message: $"Failed after {attempt} attempts. Last error: {ex.Message}");
                 }
 
-                await Task.Delay(
-                    TimeSpan.FromMilliseconds(500),
-                    cancellationToken);
+                Console.WriteLine(
+                    $"{job.Name} failed on attempt {attempt}. Retrying...");
+
+                try
+                {
+                    await Task.Delay(
+                        TimeSpan.FromMilliseconds(500),
+                        cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    return new JobResult(
+                        JobId: job.Id,
+                        JobName: job.Name,
+                        Success: false,
+                        Cancelled: true,
+                        Attempts: attempt,
+                        Message: "Job was cancelled while waiting to retry");
+                }
             }
         }
 
         return new JobResult(
             JobId: job.Id,
+            JobName: job.Name,
             Success: false,
             Cancelled: false,
             Attempts: _maxRetryAttempts,
@@ -200,7 +252,6 @@ public sealed class LargeBatchProcessor
         FakeJob job,
         CancellationToken cancellationToken)
     {
-        // Print only occasionally, otherwise 1 million console logs will be very slow.
         if (job.Id <= 20 || job.Id % 50_000 == 0)
         {
             Console.WriteLine(
@@ -221,36 +272,6 @@ public sealed class LargeBatchProcessor
     }
 }
 
-public sealed class JobSource
-{
-    private readonly IReadOnlyList<FakeJob> _jobs;
-    private readonly object _lockObject = new();
-
-    private int _nextJobIndex;
-
-    public JobSource(IReadOnlyList<FakeJob> jobs)
-    {
-        _jobs = jobs;
-    }
-
-    public FakeJob? GetNextJob()
-    {
-        lock (_lockObject)
-        {
-            if (_nextJobIndex >= _jobs.Count)
-            {
-                return null;
-            }
-
-            FakeJob job = _jobs[_nextJobIndex];
-
-            _nextJobIndex++;
-
-            return job;
-        }
-    }
-}
-
 public sealed record FakeJob(
     int Id,
     string Name,
@@ -259,6 +280,7 @@ public sealed record FakeJob(
 
 public sealed record JobResult(
     int JobId,
+    string JobName,
     bool Success,
     bool Cancelled,
     int Attempts,
@@ -270,6 +292,11 @@ public sealed record BatchSummary(
     int Succeeded,
     int Failed,
     int Cancelled
+);
+
+public sealed record BatchResult(
+    BatchSummary Summary,
+    ConcurrentDictionary<int, JobResult> Results
 );
 
 
